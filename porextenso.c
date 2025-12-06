@@ -2,16 +2,25 @@
 #include<stdlib.h>
 #include<string.h>
 #include<pthread.h>
+#include<time.h>
 
-char nome[256];
-volatile int n;
 #define LOOPS 1000
-#define NTHREADS 10
+#define NGERADORES 5
 
 static const char * unidades[]  = { "", "Um", "Dois", "Tres", "Quatro", "Cinco", "Seis", "Sete", "Oito", "Nove" };
 static const char * dezVinte[] = { "", "Onze", "Doze", "Treze", "Quatorze", "Quinze", "Dezesseis", "Dezessete", "Dezoito", "Dezenove" };
 static const char * dezenas[]   = { "", "Dez", "Vinte", "Trinta", "Quarenta", "Cinquenta", "Sessenta", "Setenta", "Oitenta", "Noventa" };
 static const char * centenas[]  = { "", "Cento", "Duzentos", "Trezentos", "Quatrocentos", "Quinhentos", "Seiscentos", "Setecentos", "Oitocentos", "Novecentos" };
+
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cond_pedido = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t cond_processado = PTHREAD_COND_INITIALIZER;
+
+static char nome[256];
+static int pedido_disponivel = 0;
+static int encerrando = 0;
+static int geradores_ativos = NGERADORES;
+static int valor_pendente = 0;
 
 char * strcatb( char * dst, const char * src )
 {
@@ -21,90 +30,137 @@ char * strcatb( char * dst, const char * src )
    return dst;
 }
 
-
-// Modifique esta funcao para rodar constantemente, esperando por alguma thread geraNumeros avise que tem um novo numero para ser escrito por extenso.
-// Apos a escrita na variavel nome, a thread deve voltar a esperar por uma nova requisicao
-void* porExtenso(void*arg){
+static void converte_para_extenso(int numero, char *dest)
+{
    char *e = " e ";
-   int c,d,dv,u; 
+   int c,d,dv,u;
 
-   //   while(1){
-   c=n/100; 
-   d=n/10-c*10;
-   u=n-(n/10)*10;
+   c=numero/100;
+   d=numero/10-c*10;
+   u=numero-(numero/10)*10;
    dv=d*10+u;
-   nome[0]='\0';
-   if (n<10){
-      if(n==0){
-         strcatb(nome,"zero");
-         strcatb(nome,unidades[u]);
-      }
-      return nome;
+   dest[0]='\0';
+
+   if (numero == 0){
+      strcatb(dest,"Zero");
+      return;
    }
-   // Onze a dezenove  
-   if ((dv>10) && (dv<20))
-      strcatb(nome,dezVinte[dv-10]);
+   if (numero<10){
+      strcatb(dest,unidades[u]);
+      return;
+   }
+   if ((dv>10) && (dv<20)){
+      strcatb(dest,dezVinte[dv-10]);
+   }
    else
-   {    
-      strcatb(nome,unidades[u]);
-      if (u==0)
-         strcatb(nome,dezenas[d]);
-      else
-      {
-         if(d>0){
-            strcatb(nome,e);
-            strcatb(nome,dezenas[d]);
+   {
+      if (u>0){
+         strcatb(dest,unidades[u]);
+      }
+      if (d>0){
+         if(u>0){
+            strcatb(dest,e);
          }
+         strcatb(dest,dezenas[d]);
       }
    }
-   if (n<100)
-      return nome;
-   // Inteiro
+   if (numero<100){
+      return;
+   }
+
    if ((d==0)&&(u==0))
    {
       if (c==1)
-         strcatb(nome,"cem");
+         strcatb(dest,"Cem");
       else
-         strcatb(nome,centenas[c]);
+         strcatb(dest,centenas[c]);
    }
    else
    {
-      strcatb(nome,e);
-      strcatb(nome,centenas[c]);
+      if(dest[0]!='\0'){
+         strcatb(dest,e);
+      }
+      strcatb(dest,centenas[c]);
    }
-
-   //}
 }
 
+// Thread que aguarda pedidos de escrita por extenso e processa um por vez
+void* porExtenso(void*arg){
+   (void)arg;
+   while(1){
+      int numero_local;
+      char nome_local[256];
+
+      pthread_mutex_lock(&mtx);
+      while(!pedido_disponivel && !encerrando){
+         pthread_cond_wait(&cond_pedido,&mtx);
+      }
+      if(!pedido_disponivel && encerrando){
+         pthread_mutex_unlock(&mtx);
+         break;
+      }
+      numero_local = valor_pendente;
+      pthread_mutex_unlock(&mtx);
+
+      converte_para_extenso(numero_local,nome_local);
+
+      pthread_mutex_lock(&mtx);
+      strcpy(nome,nome_local);
+      pedido_disponivel = 0;
+      pthread_cond_broadcast(&cond_processado);
+      pthread_mutex_unlock(&mtx);
+   }
+   return NULL;
+}
+
+// Thread geradora que envia numeros para a thread porExtenso
 void *geraNumeros(void* arg){
    int id = *((int*)arg),i,nold;
    for(i=0;i<LOOPS;i++){
       nold = rand()%1000;
-      n= nold;
-      porExtenso(NULL);
-      // Avisa a thread porExtenso que pode escrever o numero por extenso
-      printf("Thread:%d I:%d Numero:%d:%s\n",id,i,nold,nome);
+      pthread_mutex_lock(&mtx);
+      while(pedido_disponivel){
+         pthread_cond_wait(&cond_processado,&mtx);
+      }
+      valor_pendente = nold;
+      pedido_disponivel = 1;
+      pthread_cond_signal(&cond_pedido);
+      while(pedido_disponivel){
+         pthread_cond_wait(&cond_processado,&mtx);
+      }
+      char nome_local[256];
+      strcpy(nome_local,nome);
+      pthread_mutex_unlock(&mtx);
+      printf("Thread:%d I:%d Numero:%d:%s\n",id,i,nold,nome_local);
    }
-}
 
+   pthread_mutex_lock(&mtx);
+   geradores_ativos--;
+   if(geradores_ativos==0){
+      encerrando = 1;
+      pthread_cond_broadcast(&cond_pedido);
+   }
+   pthread_mutex_unlock(&mtx);
+   return NULL;
+}
 
 int main(){
    int i;
-   pthread_t p[NTHREADS],ext;
+   pthread_t p[NGERADORES],ext;
+   int ids[NGERADORES];
 
-   /*Exemplo de funcionamento de porExtenso*/
-   n=101;
-   porExtenso(NULL);
-   printf("%s\n",nome);
-   /************* Geracao de threads ****************/
+   srand((unsigned)time(NULL));
 
    pthread_create(&ext,NULL,porExtenso,NULL);
-   for(i=0;i<NTHREADS;i++){
-      pthread_create(&p[i],NULL,geraNumeros,(void*)&i);
+   for(i=0;i<NGERADORES;i++){
+      ids[i]=i;
+      pthread_create(&p[i],NULL,geraNumeros,(void*)&ids[i]);
    }
 
-   for(i=0;i<NTHREADS;i++){
+   for(i=0;i<NGERADORES;i++){
       pthread_join(p[i],NULL);
    }
+   pthread_join(ext,NULL);
 
+   return 0;
 }
